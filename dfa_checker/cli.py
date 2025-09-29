@@ -6,7 +6,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 from .analysis import TestCase, ensure_dfa, run_test_cases, summarize_results
 from .automata import Automaton, AutomatonError, AutomatonValidationError, DFA, NFA
@@ -29,6 +29,55 @@ class Session:
         if self._cached_dfa is None:
             self._cached_dfa = ensure_dfa(self.automaton)
         return self._cached_dfa
+
+
+
+
+def build_session_from_payload(payload: Mapping[str, Any]) -> Session:
+    if not isinstance(payload, Mapping):
+        raise ValueError('Config payload must be a mapping.')
+    data = dict(payload)
+
+    automaton_type = str(data.get('type', '')).lower()
+    if automaton_type not in {'dfa', 'nfa'}:
+        raise ValueError("Config field 'type' must be either 'dfa' or 'nfa'.")
+
+    states = _require_string_sequence(data, 'states')
+    alphabet = _require_string_sequence(data, 'alphabet')
+    start_state = _require_string(data, 'start_state')
+    accept_states = _require_string_sequence(data, 'accept_states')
+
+    transitions_obj = data.get('transitions')
+    if not isinstance(transitions_obj, dict):
+        raise ValueError("Config field 'transitions' must be an object.")
+
+    if automaton_type == 'dfa':
+        transitions = _normalize_dfa_transitions_from_config(transitions_obj)
+        automaton: Automaton = DFA(states, alphabet, transitions, start_state, accept_states)
+        epsilon_symbol: Optional[str] = None
+    else:
+        epsilon_symbol = data.get('epsilon_symbol', 'epsilon')
+        if not isinstance(epsilon_symbol, str) or not epsilon_symbol:
+            raise ValueError("Config field 'epsilon_symbol' must be a non-empty string.")
+        transitions = _normalize_nfa_transitions_from_config(transitions_obj)
+        automaton = NFA(
+            states,
+            alphabet,
+            transitions,
+            start_state,
+            accept_states,
+            epsilon_symbol=epsilon_symbol,
+        )
+
+    test_cases = _load_test_cases_from_payload(data.get('test_cases'))
+    session = Session(
+        automaton=automaton,
+        automaton_type=automaton_type,
+        test_cases=test_cases,
+        epsilon_symbol=epsilon_symbol if automaton_type == 'nfa' else None,
+        interactive=False,
+    )
+    return session
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -81,8 +130,8 @@ def run(argv: Sequence[str] | None = None) -> int:
 
     _display_summary(session)
     _run_tests(session)
-    highlight_path = _determine_highlight_path(session)
-    paths = _write_graphs(session, args, highlight_path)
+    highlight_path = determine_highlight_path(session)
+    paths = write_graphs_for_session(session, args.output_dir, args.base_name, highlight_path)
     if paths:
         print("\nDOT files written:")
         for path in paths:
@@ -112,47 +161,7 @@ def _build_from_config(path: Path) -> Session:
         payload = json.load(handle)
     if not isinstance(payload, dict):
         raise ValueError("Config file must define a JSON object.")
-
-    automaton_type = str(payload.get("type", "")).lower()
-    if automaton_type not in {"dfa", "nfa"}:
-        raise ValueError("Config field 'type' must be either 'dfa' or 'nfa'.")
-
-    states = _require_string_sequence(payload, "states")
-    alphabet = _require_string_sequence(payload, "alphabet")
-    start_state = _require_string(payload, "start_state")
-    accept_states = _require_string_sequence(payload, "accept_states")
-
-    transitions_obj = payload.get("transitions")
-    if not isinstance(transitions_obj, dict):
-        raise ValueError("Config field 'transitions' must be an object.")
-
-    if automaton_type == "dfa":
-        transitions = _normalize_dfa_transitions_from_config(transitions_obj)
-        automaton: Automaton = DFA(states, alphabet, transitions, start_state, accept_states)
-        epsilon_symbol = None
-    else:
-        epsilon_symbol = payload.get("epsilon_symbol", "epsilon")
-        if not isinstance(epsilon_symbol, str) or not epsilon_symbol:
-            raise ValueError("Config field 'epsilon_symbol' must be a non-empty string.")
-        transitions = _normalize_nfa_transitions_from_config(transitions_obj)
-        automaton = NFA(
-            states,
-            alphabet,
-            transitions,
-            start_state,
-            accept_states,
-            epsilon_symbol=epsilon_symbol,
-        )
-
-    test_cases = _load_test_cases_from_payload(payload.get("test_cases"))
-    session = Session(
-        automaton=automaton,
-        automaton_type=automaton_type,
-        test_cases=test_cases,
-        epsilon_symbol=epsilon_symbol if automaton_type == "nfa" else None,
-        interactive=False,
-    )
-    return session
+    return build_session_from_payload(payload)
 
 
 def _build_interactively(*, epsilon_override: Optional[str], skip_tests: bool) -> Session:
@@ -247,7 +256,7 @@ def _run_tests(session: Session):
     return results
 
 
-def _determine_highlight_path(session: Session) -> List[Tuple[str, str]]:
+def determine_highlight_path(session: Session) -> List[Tuple[str, str]]:
     if not session.test_cases:
         return []
     try:
@@ -266,35 +275,35 @@ def _determine_highlight_path(session: Session) -> List[Tuple[str, str]]:
     return path
 
 
-def _write_graphs(
+def write_graphs_for_session(
     session: Session,
-    args: argparse.Namespace,
+    output_dir: Path | str,
+    base_name: Optional[str],
     highlight_path: Sequence[Tuple[str, str]],
 ) -> List[Path]:
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    base_name = args.base_name
+    name = (base_name or 'automaton').strip() or 'automaton'
     if session.interactive:
-        base_name = _prompt_optional(
-            f"Base filename for DOT outputs [{base_name}]: ", default=base_name
+        name = _prompt_optional(
+            f"Base filename for DOT outputs [{name}]: ", default=name
         )
-        if not base_name:
-            base_name = "automaton"
+        name = (name or 'automaton').strip() or 'automaton'
 
     written_paths: List[Path] = []
-    if session.automaton_type == "dfa":
-        dfa_path = output_dir / f"{base_name}_dfa.dot"
+    if session.automaton_type == 'dfa':
+        dfa_path = out_dir / f"{name}_dfa.dot"
         write_dot(session.automaton, str(dfa_path), highlight_path=highlight_path)
         written_paths.append(dfa_path)
-        nfa_path = output_dir / f"{base_name}_dfa_as_nfa.dot"
+        nfa_path = out_dir / f"{name}_dfa_as_nfa.dot"
         write_dot(session.automaton.as_nfa(), str(nfa_path))
         written_paths.append(nfa_path)
     else:
-        nfa_path = output_dir / f"{base_name}_nfa.dot"
+        nfa_path = out_dir / f"{name}_nfa.dot"
         write_dot(session.automaton, str(nfa_path))
         written_paths.append(nfa_path)
-        dfa_path = output_dir / f"{base_name}_dfa.dot"
+        dfa_path = out_dir / f"{name}_dfa.dot"
         write_dot(session.dfa(), str(dfa_path), highlight_path=highlight_path)
         written_paths.append(dfa_path)
     return [path.resolve() for path in written_paths]
