@@ -1155,8 +1155,7 @@ class AutomatonStudio(tk.Tk):
         suffix = path_obj.suffix.lower()
         try:
             if suffix == ".dot":
-                path_obj.write_text(dot_source + "
-", encoding="utf-8")
+                path_obj.write_text(dot_source + "\n", encoding="utf-8")
             else:
                 fmt_map = {".png": "png", ".svg": "svg", ".pdf": "pdf"}
                 fmt = fmt_map.get(suffix, "png")
