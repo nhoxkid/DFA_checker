@@ -1,16 +1,30 @@
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
-#include <vector>
-#include <stdexcept>
 
+#include <algorithm>
+#include <atomic>
+#include <cstdint>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+
+#ifdef __AVX2__
+#include <immintrin.h>
+#endif
 #ifdef _MSC_VER
 #include <intrin.h>
 #endif
 
 namespace {
 
-inline int index_for_bit(unsigned long long bit) {
-#ifdef _MSC_VER
+constexpr Py_ssize_t kMaxStates = 63;
+
+inline int bit_index(std::uint64_t bit) {
+#if defined(__GNUC__) && defined(__x86_64__)
+    unsigned long idx;
+    asm("bsf %1, %0" : "=r"(idx) : "r"(bit));
+    return static_cast<int>(idx);
+#elif defined(_MSC_VER)
     unsigned long idx = 0;
     _BitScanForward64(&idx, bit);
     return static_cast<int>(idx);
@@ -19,18 +33,54 @@ inline int index_for_bit(unsigned long long bit) {
 #endif
 }
 
-inline unsigned long long as_ull(PyObject* number) {
-    const unsigned long long value = PyLong_AsUnsignedLongLongMask(number);
+inline std::uint64_t mask_from_python(PyObject* obj) {
+    const std::uint64_t value = PyLong_AsUnsignedLongLongMask(obj);
     if (PyErr_Occurred()) {
         throw std::runtime_error("expected non-negative integer mask");
     }
     return value;
 }
 
-inline void ensure_width(Py_ssize_t count) {
-    if (count > 63) {
-        throw std::runtime_error("accelerator only handles <= 63 states");
+inline unsigned int best_thread_count(std::size_t work_items) {
+    unsigned int hw = std::max(1u, std::thread::hardware_concurrency());
+    if (work_items == 0) {
+        return 1;
     }
+    if (work_items < hw) {
+        return static_cast<unsigned int>(work_items);
+    }
+    return hw;
+}
+
+inline std::uint64_t compute_closure(
+    Py_ssize_t state_idx,
+    const std::vector<std::uint64_t>& matrix
+) {
+    std::uint64_t visited = 1ULL << state_idx;
+    std::vector<int> stack;
+    stack.reserve(16);
+    stack.push_back(static_cast<int>(state_idx));
+
+    while (!stack.empty()) {
+        const int here = stack.back();
+        stack.pop_back();
+        std::uint64_t mask = matrix[static_cast<std::size_t>(here)];
+        while (mask) {
+            const std::uint64_t bit = mask & -mask;
+            mask ^= bit;
+            const int next = bit_index(bit);
+            const std::uint64_t flag = 1ULL << next;
+            if ((visited & flag) == 0) {
+                visited |= flag;
+                stack.push_back(next);
+            }
+        }
+    }
+    return visited;
+}
+
+inline void fast_or(std::uint64_t& accumulator, std::uint64_t mask) {
+    accumulator |= mask;
 }
 
 }  // namespace
@@ -44,53 +94,71 @@ static PyObject* accel_compute_epsilon_closures(PyObject*, PyObject* args) {
     if (!seq) {
         return nullptr;
     }
+
     const Py_ssize_t count = PySequence_Fast_GET_SIZE(seq);
+    if (count > kMaxStates) {
+        Py_DECREF(seq);
+        PyErr_SetString(PyExc_ValueError, "accelerator supports up to 63 states");
+        return nullptr;
+    }
+
+    std::vector<std::uint64_t> matrix(static_cast<std::size_t>(count));
     try {
-        ensure_width(count);
-        std::vector<unsigned long long> matrix(static_cast<size_t>(count));
         for (Py_ssize_t i = 0; i < count; ++i) {
             PyObject* item = PySequence_Fast_GET_ITEM(seq, i);
-            matrix[static_cast<size_t>(i)] = as_ull(item);
+            matrix[static_cast<std::size_t>(i)] = mask_from_python(item);
         }
-        PyObject* result = PyTuple_New(count);
-        if (!result) {
-            Py_DECREF(seq);
-            return nullptr;
-        }
-        for (Py_ssize_t i = 0; i < count; ++i) {
-            unsigned long long visited = 1ULL << i;
-            std::vector<int> stack;
-            stack.push_back(static_cast<int>(i));
-            while (!stack.empty()) {
-                const int state = stack.back();
-                stack.pop_back();
-                unsigned long long mask = matrix[static_cast<size_t>(state)];
-                while (mask) {
-                    const unsigned long long bit = mask & -mask;
-                    mask ^= bit;
-                    const int idx = index_for_bit(bit);
-                    const unsigned long long flag = 1ULL << idx;
-                    if (!(visited & flag)) {
-                        visited |= flag;
-                        stack.push_back(idx);
-                    }
-                }
-            }
-            PyObject* value = PyLong_FromUnsignedLongLong(visited);
-            if (!value) {
-                Py_DECREF(result);
-                Py_DECREF(seq);
-                return nullptr;
-            }
-            PyTuple_SET_ITEM(result, i, value);
-        }
-        Py_DECREF(seq);
-        return result;
     } catch (const std::runtime_error& err) {
         Py_DECREF(seq);
         PyErr_SetString(PyExc_ValueError, err.what());
         return nullptr;
     }
+
+    std::vector<std::uint64_t> closures(static_cast<std::size_t>(count));
+    const unsigned int thread_count = best_thread_count(static_cast<std::size_t>(count));
+    const Py_ssize_t chunk = thread_count ? (count + thread_count - 1) / thread_count : count;
+    std::vector<std::thread> workers;
+    workers.reserve(thread_count);
+
+    Py_BEGIN_ALLOW_THREADS
+    for (unsigned int t = 0; t < thread_count; ++t) {
+        const Py_ssize_t start = static_cast<Py_ssize_t>(t) * chunk;
+        if (start >= count) {
+            break;
+        }
+        const Py_ssize_t end = std::min<Py_ssize_t>(count, start + chunk);
+        workers.emplace_back([
+            start,
+            end,
+            &matrix,
+            &closures
+        ]() {
+            for (Py_ssize_t idx = start; idx < end; ++idx) {
+                closures[static_cast<std::size_t>(idx)] = compute_closure(idx, matrix);
+            }
+        });
+    }
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+    Py_END_ALLOW_THREADS
+
+    PyObject* result = PyTuple_New(count);
+    if (!result) {
+        Py_DECREF(seq);
+        return nullptr;
+    }
+    for (Py_ssize_t i = 0; i < count; ++i) {
+        PyObject* value = PyLong_FromUnsignedLongLong(closures[static_cast<std::size_t>(i)]);
+        if (!value) {
+            Py_DECREF(seq);
+            Py_DECREF(result);
+            return nullptr;
+        }
+        PyTuple_SET_ITEM(result, i, value);
+    }
+    Py_DECREF(seq);
+    return result;
 }
 
 static PyObject* accel_build_symbol_matrix(PyObject*, PyObject* args) {
@@ -99,85 +167,158 @@ static PyObject* accel_build_symbol_matrix(PyObject*, PyObject* args) {
     if (!PyArg_ParseTuple(args, "OO", &transition_obj, &closures_obj)) {
         return nullptr;
     }
+
     PyObject* rows = PySequence_Fast(transition_obj, "transition matrix must be a sequence");
     if (!rows) {
         return nullptr;
     }
-    PyObject* closures = PySequence_Fast(closures_obj, "closures must be a sequence");
-    if (!closures) {
+    PyObject* closures_seq = PySequence_Fast(closures_obj, "closures must be a sequence");
+    if (!closures_seq) {
         Py_DECREF(rows);
         return nullptr;
     }
+
     const Py_ssize_t state_count = PySequence_Fast_GET_SIZE(rows);
-    try {
-        ensure_width(state_count);
-        std::vector<unsigned long long> closure_masks(static_cast<size_t>(state_count));
-        for (Py_ssize_t i = 0; i < state_count; ++i) {
-            closure_masks[static_cast<size_t>(i)] = as_ull(PySequence_Fast_GET_ITEM(closures, i));
-        }
-        PyObject* outer = PyTuple_New(state_count);
-        if (!outer) {
-            Py_DECREF(rows);
-            Py_DECREF(closures);
-            return nullptr;
-        }
-        Py_ssize_t symbol_count = 0;
-        for (Py_ssize_t state = 0; state < state_count; ++state) {
-            PyObject* row_src = PySequence_Fast(PySequence_Fast_GET_ITEM(rows, state), "row must be sequence");
-            if (!row_src) {
-                Py_DECREF(outer);
-                Py_DECREF(rows);
-                Py_DECREF(closures);
-                return nullptr;
-            }
-            if (state == 0) {
-                symbol_count = PySequence_Fast_GET_SIZE(row_src);
-            }
-            PyObject* new_row = PyTuple_New(symbol_count);
-            if (!new_row) {
-                Py_DECREF(row_src);
-                Py_DECREF(outer);
-                Py_DECREF(rows);
-                Py_DECREF(closures);
-                return nullptr;
-            }
-            for (Py_ssize_t symbol = 0; symbol < symbol_count; ++symbol) {
-                unsigned long long mask = as_ull(PySequence_Fast_GET_ITEM(row_src, symbol));
-                unsigned long long closed = 0;
-                while (mask) {
-                    const unsigned long long bit = mask & -mask;
-                    mask ^= bit;
-                    const int idx = index_for_bit(bit);
-                    closed |= closure_masks[static_cast<size_t>(idx)];
-                }
-                PyObject* value = PyLong_FromUnsignedLongLong(closed);
-                if (!value) {
-                    Py_DECREF(row_src);
-                    Py_DECREF(new_row);
-                    Py_DECREF(outer);
-                    Py_DECREF(rows);
-                    Py_DECREF(closures);
-                    return nullptr;
-                }
-                PyTuple_SET_ITEM(new_row, symbol, value);
-            }
-            Py_DECREF(row_src);
-            PyTuple_SET_ITEM(outer, state, new_row);
-        }
+    if (state_count > kMaxStates) {
         Py_DECREF(rows);
-        Py_DECREF(closures);
-        return outer;
+        Py_DECREF(closures_seq);
+        PyErr_SetString(PyExc_ValueError, "accelerator supports up to 63 states");
+        return nullptr;
+    }
+
+    std::vector<std::uint64_t> closure_masks(static_cast<std::size_t>(state_count));
+    try {
+        for (Py_ssize_t i = 0; i < state_count; ++i) {
+            closure_masks[static_cast<std::size_t>(i)] = mask_from_python(
+                PySequence_Fast_GET_ITEM(closures_seq, i)
+            );
+        }
     } catch (const std::runtime_error& err) {
         Py_DECREF(rows);
-        Py_DECREF(closures);
+        Py_DECREF(closures_seq);
         PyErr_SetString(PyExc_ValueError, err.what());
         return nullptr;
     }
+
+    std::vector<std::vector<std::uint64_t>> transitions(static_cast<std::size_t>(state_count));
+    Py_ssize_t symbol_count = 0;
+    try {
+        for (Py_ssize_t state = 0; state < state_count; ++state) {
+            PyObject* row_obj = PySequence_Fast(
+                PySequence_Fast_GET_ITEM(rows, state),
+                "row must be a sequence"
+            );
+            if (!row_obj) {
+                throw std::runtime_error("row conversion failed");
+            }
+            const Py_ssize_t row_len = PySequence_Fast_GET_SIZE(row_obj);
+            if (state == 0) {
+                symbol_count = row_len;
+            } else if (row_len != symbol_count) {
+                Py_DECREF(row_obj);
+                throw std::runtime_error("row lengths must match");
+            }
+            std::vector<std::uint64_t> row(static_cast<std::size_t>(row_len));
+            for (Py_ssize_t symbol = 0; symbol < row_len; ++symbol) {
+                row[static_cast<std::size_t>(symbol)] = mask_from_python(
+                    PySequence_Fast_GET_ITEM(row_obj, symbol)
+                );
+            }
+            Py_DECREF(row_obj);
+            transitions[static_cast<std::size_t>(state)] = std::move(row);
+        }
+    } catch (const std::runtime_error& err) {
+        Py_DECREF(rows);
+        Py_DECREF(closures_seq);
+        PyErr_SetString(PyExc_ValueError, err.what());
+        return nullptr;
+    }
+
+    std::vector<std::vector<std::uint64_t>> result(
+        static_cast<std::size_t>(state_count),
+        std::vector<std::uint64_t>(static_cast<std::size_t>(symbol_count), 0ULL)
+    );
+
+    const unsigned int thread_count = best_thread_count(static_cast<std::size_t>(state_count));
+    const Py_ssize_t chunk = thread_count ? (state_count + thread_count - 1) / thread_count : state_count;
+    std::vector<std::thread> workers;
+    workers.reserve(thread_count);
+
+    Py_BEGIN_ALLOW_THREADS
+    for (unsigned int t = 0; t < thread_count; ++t) {
+        const Py_ssize_t start = static_cast<Py_ssize_t>(t) * chunk;
+        if (start >= state_count) {
+            break;
+        }
+        const Py_ssize_t end = std::min<Py_ssize_t>(state_count, start + chunk);
+        workers.emplace_back([
+            start,
+            end,
+            symbol_count,
+            &transitions,
+            &closure_masks,
+            &result
+        ]() {
+            for (Py_ssize_t state = start; state < end; ++state) {
+                auto& row = result[static_cast<std::size_t>(state)];
+                const auto& src_row = transitions[static_cast<std::size_t>(state)];
+                for (Py_ssize_t symbol = 0; symbol < symbol_count; ++symbol) {
+                    std::uint64_t mask = src_row[static_cast<std::size_t>(symbol)];
+                    std::uint64_t acc = 0ULL;
+                    while (mask) {
+                        const std::uint64_t bit = mask & -mask;
+                        mask ^= bit;
+                        const int idx = bit_index(bit);
+                        fast_or(acc, closure_masks[static_cast<std::size_t>(idx)]);
+                    }
+                    row[static_cast<std::size_t>(symbol)] = acc;
+                }
+            }
+        });
+    }
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+    Py_END_ALLOW_THREADS
+
+    PyObject* outer = PyTuple_New(state_count);
+    if (!outer) {
+        Py_DECREF(rows);
+        Py_DECREF(closures_seq);
+        return nullptr;
+    }
+    for (Py_ssize_t state = 0; state < state_count; ++state) {
+        PyObject* row = PyTuple_New(symbol_count);
+        if (!row) {
+            Py_DECREF(rows);
+            Py_DECREF(closures_seq);
+            Py_DECREF(outer);
+            return nullptr;
+        }
+        for (Py_ssize_t symbol = 0; symbol < symbol_count; ++symbol) {
+            PyObject* value = PyLong_FromUnsignedLongLong(
+                result[static_cast<std::size_t>(state)][static_cast<std::size_t>(symbol)]
+            );
+            if (!value) {
+                Py_DECREF(rows);
+                Py_DECREF(closures_seq);
+                Py_DECREF(outer);
+                Py_DECREF(row);
+                return nullptr;
+            }
+            PyTuple_SET_ITEM(row, symbol, value);
+        }
+        PyTuple_SET_ITEM(outer, state, row);
+    }
+
+    Py_DECREF(rows);
+    Py_DECREF(closures_seq);
+    return outer;
 }
 
 static PyObject* accel_subset_step(PyObject*, PyObject* args) {
     PyObject* symbol_matrix = nullptr;
-    unsigned long long subset_mask = 0;
+    unsigned long long subset_mask = 0ULL;
     Py_ssize_t symbol_index = 0;
     if (!PyArg_ParseTuple(args, "OKn", &symbol_matrix, &subset_mask, &symbol_index)) {
         return nullptr;
@@ -187,40 +328,43 @@ static PyObject* accel_subset_step(PyObject*, PyObject* args) {
         return nullptr;
     }
     const Py_ssize_t state_count = PySequence_Fast_GET_SIZE(rows);
-    unsigned long long result = 0;
-    try {
-        ensure_width(state_count);
-        while (subset_mask) {
-            const unsigned long long bit = subset_mask & -subset_mask;
-            subset_mask ^= bit;
-            const int idx = index_for_bit(bit);
-            if (idx >= state_count) {
-                Py_DECREF(rows);
-                PyErr_SetString(PyExc_ValueError, "subset state index out of range");
-                return nullptr;
-            }
-            PyObject* row_src = PySequence_Fast(PySequence_Fast_GET_ITEM(rows, idx), "row must be sequence");
-            if (!row_src) {
-                Py_DECREF(rows);
-                return nullptr;
-            }
-            const Py_ssize_t row_len = PySequence_Fast_GET_SIZE(row_src);
-            if (symbol_index < 0 || symbol_index >= row_len) {
-                Py_DECREF(row_src);
-                Py_DECREF(rows);
-                PyErr_SetString(PyExc_ValueError, "symbol index out of range");
-                return nullptr;
-            }
-            result |= as_ull(PySequence_Fast_GET_ITEM(row_src, symbol_index));
-            Py_DECREF(row_src);
-        }
+    if (state_count > kMaxStates) {
         Py_DECREF(rows);
-        return PyLong_FromUnsignedLongLong(result);
-    } catch (const std::runtime_error& err) {
-        Py_DECREF(rows);
-        PyErr_SetString(PyExc_ValueError, err.what());
+        PyErr_SetString(PyExc_ValueError, "accelerator supports up to 63 states");
         return nullptr;
     }
+
+    std::uint64_t result = 0ULL;
+    std::uint64_t temp = static_cast<std::uint64_t>(subset_mask);
+    while (temp) {
+        const std::uint64_t bit = temp & -temp;
+        temp ^= bit;
+        const int idx = bit_index(bit);
+        if (idx >= state_count) {
+            Py_DECREF(rows);
+            PyErr_SetString(PyExc_ValueError, "subset state index out of range");
+            return nullptr;
+        }
+        PyObject* row_obj = PySequence_Fast(
+            PySequence_Fast_GET_ITEM(rows, idx),
+            "row must be sequence"
+        );
+        if (!row_obj) {
+            Py_DECREF(rows);
+            return nullptr;
+        }
+        const Py_ssize_t row_len = PySequence_Fast_GET_SIZE(row_obj);
+        if (symbol_index < 0 || symbol_index >= row_len) {
+            Py_DECREF(row_obj);
+            Py_DECREF(rows);
+            PyErr_SetString(PyExc_ValueError, "symbol index out of range");
+            return nullptr;
+        }
+        result |= mask_from_python(PySequence_Fast_GET_ITEM(row_obj, symbol_index));
+        Py_DECREF(row_obj);
+    }
+    Py_DECREF(rows);
+    return PyLong_FromUnsignedLongLong(result);
 }
 
 static PyMethodDef AcceleratorMethods[] = {
