@@ -1062,8 +1062,19 @@ class AutomatonStudio(tk.Tk):
 
     def _generate_graphs(self) -> None:
         if not self.session:
-            messagebox.showinfo("Automaton Studio", "Nothing to draw yet.", parent=self)
-            return
+            payload = self.config_text.get("1.0", "end").strip()
+            if not payload:
+                messagebox.showinfo("Automaton Studio", "Paste a config first.", parent=self)
+                return
+            try:
+                config_payload = load_payload_from_text(payload)
+                session = build_session_from_payload(config_payload)
+            except Exception as exc:  # pylint: disable=broad-except
+                messagebox.showerror("Automaton Studio", str(exc), parent=self)
+                return
+            self.session = session
+            self._graph_report = analyze_graph(session.automaton)
+            self._last_highlight = determine_highlight_path(session) or []
         highlight = self._last_highlight or determine_highlight_path(self.session)
         output_dir = self.output_dir_var.get().strip() or "artifacts"
         base_name = self.base_name_var.get().strip() or "automaton"
