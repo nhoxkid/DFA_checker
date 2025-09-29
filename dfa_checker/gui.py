@@ -987,7 +987,12 @@ class AutomatonStudio(tk.Tk):
             return
         self._last_dot_paths = [str(path) for path in paths]
         self.status_var.set(f"DOT updated ({len(paths)} file(s)).")
+        if paths:
+            files_text = "\n".join(["Saved DOT files:"] + [str(path) for path in paths])
+            messagebox.showinfo("Automaton Studio", files_text, parent=self)
+        self._update_graph_panel()
         self._update_interaction_states()
+        self._refresh_button_colors()
     # ---------------------------------------------------------------
     def _on_close(self) -> None:
         self._worker_stop.set()
