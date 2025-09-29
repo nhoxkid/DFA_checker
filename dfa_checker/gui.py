@@ -77,6 +77,12 @@ s0:c>s0
 s1:a>s2
 s1:b>s2
 s1:c>s3
+s2:a>s3
+s2:b>s3
+s2:c>s0
+s3:a>s0
+s3:b>s1
+s3:c>s0
 """
 
 ANIMATION_INTERVAL_MS = 500
@@ -85,7 +91,7 @@ ANIMATION_INTERVAL_MS = 500
 class AutomatonStudio(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Automaton Studio")
+        self.title("Automaton test")
         self.geometry("1180x780")
         self.minsize(960, 640)
 
@@ -135,7 +141,7 @@ class AutomatonStudio(tk.Tk):
 
         self.title_label = tk.Label(
             self.header,
-            text="Automaton Studio",
+            text="Automaton test",
             font=("Segoe UI Semibold", 16),
         )
         self.title_label.pack(side="left")
