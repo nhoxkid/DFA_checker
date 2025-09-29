@@ -16,6 +16,134 @@ TOKEN_SPLIT_RE = re.compile(r"[\s,]+")
 EMPTY_INPUT_LABEL = "<empty>"
 
 
+SECTION_REQUIRED_KEYS = {"states", "initial", "accepting", "alphabet", "transitions"}
+SECTION_OPTIONAL_KEYS = {"tests", "epsilon"}
+TRANSITION_SPLIT_RE = re.compile(r"[|,]+")
+
+
+def load_payload_from_text(text: str) -> Mapping[str, Any]:
+    stripped = text.strip()
+    if not stripped:
+        raise ValueError("Config text is empty.")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return _parse_structured_config(text)
+
+
+def _parse_structured_config(text: str) -> Mapping[str, Any]:
+    sections: dict[str, list[str]] = {}
+    current: Optional[str] = None
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("//") or line.startswith(";"):
+            continue
+        if line.startswith("#"):
+            key = line[1:].strip().lower()
+            if not key:
+                raise ValueError("Encountered empty section header.")
+            canonical = key
+            if canonical not in SECTION_REQUIRED_KEYS and canonical not in SECTION_OPTIONAL_KEYS:
+                raise ValueError(f"Unknown section '#{key}'.")
+            current = canonical
+            sections.setdefault(canonical, [])
+            continue
+        if current is None:
+            raise ValueError("Found content before any section header.")
+        sections.setdefault(current, []).append(line)
+
+    missing = [key for key in SECTION_REQUIRED_KEYS if key not in sections]
+    if missing:
+        formatted = ', '.join(f'#{item}' for item in missing)
+        raise ValueError(f"Missing required section(s): {formatted}")
+
+    def _collect(name: str) -> list[str]:
+        return [item.strip() for item in sections.get(name, []) if item.strip()]
+
+    states = _collect("states")
+    if not states:
+        raise ValueError("Section '#states' must list at least one state.")
+    alphabet = _collect("alphabet")
+    start_candidates = _collect("initial")
+    if len(start_candidates) != 1:
+        raise ValueError("Section '#initial' must contain exactly one state.")
+    start_state = start_candidates[0]
+    accepting = _collect("accepting")
+
+    epsilon_lines = _collect("epsilon")
+    epsilon_symbol = epsilon_lines[0] if epsilon_lines else "epsilon"
+
+    transitions_raw = sections.get("transitions", [])
+    if not transitions_raw:
+        raise ValueError("Section '#transitions' must define at least one transition.")
+
+    transitions_acc: dict[str, dict[str, list[str]]] = {}
+    seen_nondeterministic = False
+
+    for raw in transitions_raw:
+        if ">" not in raw or ":" not in raw:
+            raise ValueError(f"Malformed transition line: '{raw}'. Expected 'state:symbol>dest'.")
+        left, right = raw.split(">", 1)
+        state_part, symbol_part = left.split(":", 1)
+        state = state_part.strip()
+        symbol = symbol_part.strip()
+        if not state or not symbol:
+            raise ValueError(f"Incomplete transition definition: '{raw}'.")
+        destinations = [dest.strip() for dest in TRANSITION_SPLIT_RE.split(right) if dest.strip()]
+        if not destinations:
+            raise ValueError(f"Transition '{raw}' must specify at least one destination state.")
+        bucket = transitions_acc.setdefault(state, {})
+        if symbol in bucket:
+            existing = bucket[symbol]
+            for dest in destinations:
+                if dest not in existing:
+                    existing.append(dest)
+            if len(existing) > 1:
+                seen_nondeterministic = True
+        else:
+            bucket[symbol] = destinations[:]
+            if len(destinations) > 1:
+                seen_nondeterministic = True
+
+    states_set = dict.fromkeys(states)
+    if start_state not in states_set:
+        states.append(start_state)
+        states_set[start_state] = None
+    for mapping in transitions_acc.values():
+        for dests in mapping.values():
+            for dest in dests:
+                if dest not in states_set:
+                    states.append(dest)
+                    states_set[dest] = None
+
+    for state in states:
+        transitions_acc.setdefault(state, {})
+
+    automaton_type = "nfa" if seen_nondeterministic else "dfa"
+    if automaton_type == "nfa":
+        transitions: dict[str, dict[str, list[str]]] = {
+            state: {symbol: dests[:] for symbol, dests in mapping.items()}
+            for state, mapping in transitions_acc.items()
+        }
+    else:
+        transitions = {
+            state: {symbol: dests[0] for symbol, dests in mapping.items()}
+            for state, mapping in transitions_acc.items()
+        }
+
+    payload: dict[str, Any] = {
+        "type": automaton_type,
+        "states": states,
+        "alphabet": alphabet,
+        "start_state": start_state,
+        "accept_states": accepting,
+        "transitions": transitions,
+    }
+    if automaton_type == "nfa" or epsilon_symbol != "epsilon":
+        payload["epsilon_symbol"] = epsilon_symbol
+    return payload
 @dataclass
 class Session:
     automaton: Automaton
@@ -157,10 +285,11 @@ def _build_session(args: argparse.Namespace) -> Session:
 
 
 def _build_from_config(path: Path) -> Session:
-    with open(path, "r", encoding="utf-8") as handle:
-        payload = json.load(handle)
-    if not isinstance(payload, dict):
-        raise ValueError("Config file must define a JSON object.")
+    text = path.read_text(encoding="utf-8")
+    try:
+        payload = load_payload_from_text(text)
+    except ValueError as exc:
+        raise ValueError(f"{path.name}: {exc}") from exc
     return build_session_from_payload(payload)
 
 
