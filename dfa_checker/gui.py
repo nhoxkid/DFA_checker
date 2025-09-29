@@ -27,8 +27,12 @@ THEMES: Dict[str, Dict[str, str]] = {
         "border": "#d0d7de",
         "input_bg": "#ffffff",
         "input_fg": "#24292e",
-        "accent": "#0969da",
+        "accent": "#0d6efd",
         "accent_fg": "#ffffff",
+        "accent_hover": "#0b5ed7",
+        "accent_hover_fg": "#ffffff",
+        "accent_disabled": "#9ec5fe",
+        "accent_disabled_fg": "#1f2933",
     },
     "dark": {
         "bg": "#0d1117",
@@ -40,6 +44,10 @@ THEMES: Dict[str, Dict[str, str]] = {
         "input_fg": "#c9d1d9",
         "accent": "#2f81f7",
         "accent_fg": "#0d1117",
+        "accent_hover": "#508bff",
+        "accent_hover_fg": "#0d1117",
+        "accent_disabled": "#1f3b70",
+        "accent_disabled_fg": "#8b949e",
     },
 }
 
@@ -98,6 +106,9 @@ class AutomatonStudio(tk.Tk):
         self._last_tokens: Sequence[str] = ()
         self._last_highlight: List[Tuple[str, str]] = []
         self._last_dot_paths: List[str] = []
+        self._graph_report: Dict[str, object] = {}
+        self._button_bindings: Dict[tk.Button, bool] = {}
+        self._current_palette: Dict[str, str] = THEMES[self.current_theme].copy()
 
         self._build_ui()
         self.apply_theme()
@@ -238,7 +249,7 @@ class AutomatonStudio(tk.Tk):
         # right pane -------------------------------------------------
         self.output_frame = tk.Frame(self.body, bd=0)
         self.output_frame.grid(row=0, column=1, sticky="nsew")
-        self.output_frame.rowconfigure(4, weight=1)
+        self.output_frame.rowconfigure(5, weight=1)
 
         self.output_label = tk.Label(
             self.output_frame,
@@ -348,8 +359,22 @@ class AutomatonStudio(tk.Tk):
         )
         self.simulation_status_label.grid(row=1, column=0, columnspan=2, sticky="ew")
 
+        self.graph_container = tk.Frame(self.output_frame, bd=1, relief="solid")
+        self.graph_container.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self.graph_container.columnconfigure(0, weight=1)
+
+        self.graph_text = tk.Text(
+            self.graph_container,
+            wrap="word",
+            font=self.base_font,
+            height=6,
+            relief="flat",
+            state="disabled",
+        )
+        self.graph_text.grid(row=0, column=0, sticky="nsew")
+
         self.output_container = tk.Frame(self.output_frame, bd=1, relief="solid")
-        self.output_container.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
+        self.output_container.grid(row=5, column=0, sticky="nsew", pady=(12, 0))
         self.output_container.rowconfigure(0, weight=1)
         self.output_container.columnconfigure(0, weight=1)
 
@@ -391,6 +416,7 @@ class AutomatonStudio(tk.Tk):
             self.validation_frame,
             self.control_frame,
             self.simulation_container,
+            self.graph_container,
             self.output_container,
         ]
         self._labels = [
@@ -413,17 +439,20 @@ class AutomatonStudio(tk.Tk):
             self.pause_button,
             self.reset_button,
         ]
-        self._text_widgets = [self.config_text, self.simulation_text, self.output_text]
+        self._text_widgets = [self.config_text, self.simulation_text, self.graph_text, self.output_text]
         self._entries = [self.output_dir_entry, self.base_name_entry, self.test_entry]
     # ---------------------------------------------------------------
     def apply_theme(self) -> None:
         palette = THEMES[self.current_theme]
+        self._current_palette = palette
         self.configure(bg=palette["bg"])
         for frame in self._surface_frames:
             frame_bg = palette["bg"] if frame is self else palette["surface"]
             frame.configure(bg=frame_bg)
         self.config_container.configure(bg=palette["border"])
         self.simulation_container.configure(bg=palette["border"])
+        if hasattr(self, "graph_container"):
+            self.graph_container.configure(bg=palette["border"])
         self.output_container.configure(bg=palette["border"])
         for label in self._labels:
             label.configure(bg=palette["surface"], fg=palette["text"])
@@ -450,14 +479,8 @@ class AutomatonStudio(tk.Tk):
             if state == "disabled":
                 text_widget.configure(state="disabled")
         for button in self._buttons:
-            button.configure(
-                bg=palette["accent"],
-                fg=palette["accent_fg"],
-                activebackground=palette["accent"],
-                activeforeground=palette["accent_fg"],
-                relief="flat",
-                borderwidth=0,
-            )
+            button.configure(relief="flat", borderwidth=0, highlightthickness=0)
+        self._style_buttons(palette)
         self.status_bar.configure(bg=palette["surface"], fg=palette["muted"])
         self.theme_button.configure(
             text="Dark mode" if self.current_theme == "light" else "Light mode"
@@ -466,6 +489,37 @@ class AutomatonStudio(tk.Tk):
     def toggle_theme(self) -> None:
         self.current_theme = "dark" if self.current_theme == "light" else "light"
         self.apply_theme()
+
+    def _style_buttons(self, palette: Dict[str, str]) -> None:
+        self._current_palette = palette
+        for button in self._buttons:
+            button.configure(
+                activebackground=palette["accent_hover"],
+                activeforeground=palette["accent_hover_fg"],
+                disabledforeground=palette["accent_disabled_fg"],
+            )
+            if button not in self._button_bindings:
+                button.bind("<Enter>", lambda event, b=button: self._on_button_hover(b, True))
+                button.bind("<Leave>", lambda event, b=button: self._on_button_hover(b, False))
+                self._button_bindings[button] = True
+        self._refresh_button_colors()
+
+    def _refresh_button_colors(self) -> None:
+        palette = self._current_palette
+        for button in self._buttons:
+            if button["state"] == "disabled":
+                button.configure(bg=palette["accent_disabled"], fg=palette["accent_disabled_fg"])
+            else:
+                button.configure(bg=palette["accent"], fg=palette["accent_fg"])
+
+    def _on_button_hover(self, button: tk.Button, entering: bool) -> None:
+        if button["state"] == "disabled":
+            return
+        palette = self._current_palette
+        if entering:
+            button.configure(bg=palette["accent_hover"], fg=palette["accent_hover_fg"])
+        else:
+            button.configure(bg=palette["accent"], fg=palette["accent_fg"])
     # ---------------------------------------------------------------
     def analyze(self) -> None:
         if self._busy:
@@ -575,6 +629,7 @@ class AutomatonStudio(tk.Tk):
         self.session = session
         self._last_highlight = list(highlight)
         self._last_dot_paths = list(dot_paths)
+        self._graph_report = dict(graph_report)
         self._worker = None
         self._set_busy(False)
         self._release_analysis_lock()
@@ -593,6 +648,7 @@ class AutomatonStudio(tk.Tk):
             lines.append("---------")
             lines.extend(dot_paths)
         self._update_output(lines)
+        self._update_graph_panel()
 
         if graph_error is not None:
             messagebox.showwarning(
@@ -649,6 +705,16 @@ class AutomatonStudio(tk.Tk):
             lines.append(f"  {state}: {', '.join(parts) if parts else '<none>'}")
         return lines
 
+    def _update_graph_panel(self) -> None:
+        self.graph_text.configure(state="normal")
+        self.graph_text.delete("1.0", "end")
+        if not self._graph_report:
+            self.graph_text.insert("end", "No graph diagnostics available.\n")
+        else:
+            lines = self._format_graph_report(self._graph_report)
+            self.graph_text.insert("end", "\n".join(lines) + "\n")
+        self.graph_text.configure(state="disabled")
+
     def _format_graph_report(self, report: Dict[str, object]) -> List[str]:
         lines = ["Graph Check", "-----------"]
         reachable = report.get("reachable_count")
@@ -703,6 +769,10 @@ class AutomatonStudio(tk.Tk):
         self.output_text.configure(state="normal")
         self.output_text.delete("1.0", "end")
         self.output_text.configure(state="disabled")
+        if hasattr(self, "graph_text"):
+            self.graph_text.configure(state="normal")
+            self.graph_text.delete("1.0", "end")
+            self.graph_text.configure(state="disabled")
         self.status_var.set("Cleared.")
         self.validation_result_var.set("No string tested.")
         self.test_entry.delete(0, "end")
@@ -710,14 +780,18 @@ class AutomatonStudio(tk.Tk):
         self._last_tokens = ()
         self._last_highlight.clear()
         self._last_dot_paths.clear()
+        self._graph_report.clear()
+        self._update_graph_panel()
         self._reset_simulation(clear_path=True)
         self._update_interaction_states()
+        self._refresh_button_colors()
 
     def _set_busy(self, busy: bool, status: Optional[str] = None) -> None:
         self._busy = busy
         if status:
             self.status_var.set(status)
         self._update_interaction_states()
+        self._refresh_button_colors()
 
     def _update_interaction_states(self) -> None:
         if self._busy:
@@ -732,6 +806,7 @@ class AutomatonStudio(tk.Tk):
                 self.reset_button,
             ):
                 button.configure(state="disabled")
+            self._refresh_button_colors()
             return
 
         self.analyze_button.configure(state="normal")
