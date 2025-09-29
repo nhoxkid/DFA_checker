@@ -6,7 +6,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
-from .analysis import run_test_cases, summarize_results
+from .analysis import analyze_graph, run_test_cases, summarize_results
 from .automata import AutomatonError
 from .cli import (
     EMPTY_INPUT_LABEL,
@@ -65,7 +65,7 @@ s1:b>s2
 s1:c>s3
 """
 
-ANIMATION_INTERVAL_MS = 750
+ANIMATION_INTERVAL_MS = 500
 
 
 class AutomatonStudio(tk.Tk):
@@ -530,6 +530,7 @@ class AutomatonStudio(tk.Tk):
         if cancelled():
             return
 
+        graph_report = analyze_graph(session.automaton)
         highlight = determine_highlight_path(session)
         if cancelled():
             return
@@ -552,6 +553,7 @@ class AutomatonStudio(tk.Tk):
                 test_lines,
                 dot_paths,
                 highlight,
+                graph_report,
                 graph_error,
             ),
         )
@@ -567,6 +569,7 @@ class AutomatonStudio(tk.Tk):
         test_lines: Sequence[str],
         dot_paths: Sequence[str],
         highlight: Sequence[Tuple[str, str]],
+        graph_report: Dict[str, object],
         graph_error: Optional[Exception] = None,
     ) -> None:
         self.session = session
@@ -578,6 +581,8 @@ class AutomatonStudio(tk.Tk):
 
         lines: List[str] = ["Automaton Summary", "-----------------"]
         lines.extend(summary_lines)
+        lines.append("")
+        lines.extend(self._format_graph_report(graph_report))
         lines.append("")
         lines.append("Test Report")
         lines.append("-----------")
@@ -642,6 +647,34 @@ class AutomatonStudio(tk.Tk):
                 dest_text = "|".join(sorted(destinations)) if destinations else "-"
                 parts.append(f"{symbol}->{dest_text}")
             lines.append(f"  {state}: {', '.join(parts) if parts else '<none>'}")
+        return lines
+
+    def _format_graph_report(self, report: Dict[str, object]) -> List[str]:
+        lines = ["Graph Check", "-----------"]
+        reachable = report.get("reachable_count")
+        total = report.get("state_count")
+        if reachable is not None and total is not None:
+            lines.append(f"Reachable states: {reachable} / {total}")
+        unreachable = report.get("unreachable") or []
+        if unreachable:
+            lines.append("Unreachable: " + ", ".join(unreachable))
+        dead_states = report.get("dead_states") or []
+        if dead_states:
+            lines.append("Dead states: " + ", ".join(dead_states))
+        missing = report.get("missing_symbols") or []
+        if missing:
+            formatted = ", ".join(f"{state}:{symbol}" for state, symbol in missing)
+            lines.append("Missing transitions: " + formatted)
+        nondet = report.get("nondeterministic_states") or []
+        if nondet:
+            lines.append("Non-deterministic states: " + ", ".join(nondet))
+        transition_count = report.get("transition_count")
+        if transition_count is not None:
+            lines.append("Total transitions: " + str(transition_count))
+        if report.get("is_total"):
+            lines.append("Transition function is total.")
+        if report.get("has_epsilon"):
+            lines.append("Includes epsilon transitions.")
         return lines
 
     def _format_test_lines(self, results, summary: Dict[str, int]) -> List[str]:
@@ -772,19 +805,10 @@ class AutomatonStudio(tk.Tk):
         if not self.session:
             return [], False
         try:
-            dfa = self.session.dfa()
+            path, accepted = self.session.dfa().transition_path(tokens)
         except AutomatonError:
             return [], False
-        path: List[Tuple[str, str, str]] = []
-        current = dfa.start_state
-        for symbol in tokens:
-            destinations = dfa.transition_from(current, symbol)
-            if not destinations:
-                return path, False
-            next_state = next(iter(destinations))
-            path.append((current, symbol, next_state))
-            current = next_state
-        return path, current in dfa.accept_states
+        return path, accepted
 
     def _prepare_simulation(self, path: Sequence[Tuple[str, str, str]], accepts: bool) -> None:
         self._simulation_path = list(path)
@@ -830,7 +854,7 @@ class AutomatonStudio(tk.Tk):
         self.simulation_text.configure(state="normal")
         self.simulation_text.insert(
             "end",
-            f"{self._simulation_index + 1}. d({src}, {symbol}) ? {dest}\n",
+            f"{self._simulation_index + 1}. δ({src}, {symbol}) → {dest}\n",
         )
         self.simulation_text.configure(state="disabled")
         self.simulation_text.see("end")

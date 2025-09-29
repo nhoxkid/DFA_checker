@@ -265,7 +265,7 @@ class Automaton:
 
 
 class DFA(Automaton):
-    __slots__ = ("_delta",)
+    __slots__ = ("_delta", "_accelerator_ready")
 
     def __init__(
         self,
@@ -289,6 +289,7 @@ class DFA(Automaton):
                     )
         super().__init__(states, alphabet, normalized, start_state, accept_states)
         self._delta = self._build_delta()
+        self._accelerator_ready = _accelerator is not None
         self.validate()
 
     def _build_delta(self) -> Tuple[Tuple[int, ...], ...]:
@@ -308,15 +309,59 @@ class DFA(Automaton):
         return True
 
     def accepts(self, input_symbols: Iterable[str]) -> bool:
+        symbol_ids = self._input_to_symbol_ids(input_symbols)
+        if _accelerator is not None and self._accelerator_ready:
+            try:
+                return bool(
+                    _accelerator.dfa_accepts(self._delta, self._start_idx, self._accept_mask, symbol_ids)
+                )
+            except (ValueError, TypeError):
+                pass
+        return self._accepts_python(symbol_ids)
+
+    def _accepts_python(self, symbol_ids: Sequence[int]) -> bool:
         current = self._start_idx
-        for symbol_id in self._input_to_symbol_ids(input_symbols):
-            if symbol_id < 0:
+        for symbol_id in symbol_ids:
+            if symbol_id < 0 or symbol_id >= len(self._delta[current]):
                 return False
             destination = self._delta[current][symbol_id]
             if destination < 0:
                 return False
             current = destination
         return bool(self._accept_mask & (1 << current))
+
+    def transition_path(self, tokens: Sequence[str]) -> Tuple[List[Tuple[str, str, str]], bool]:
+        symbol_ids = self._input_to_symbol_ids(tokens)
+        if any(symbol_id < 0 for symbol_id in symbol_ids):
+            return [], False
+        if _accelerator is not None and self._accelerator_ready:
+            try:
+                trace = _accelerator.dfa_trace(self._delta, self._start_idx, symbol_ids)
+            except (ValueError, TypeError):
+                trace = None
+            if trace is not None:
+                states_idx = list(trace)
+                path: List[Tuple[str, str, str]] = []
+                for idx, dest_idx in enumerate(states_idx[1:]):
+                    src_idx = states_idx[idx]
+                    path.append((self._states[src_idx], tokens[idx], self._states[dest_idx]))
+                accepted = bool(self._accept_mask & (1 << states_idx[-1]))
+                return path, accepted
+        return self._trace_python(symbol_ids, tokens)
+
+    def _trace_python(self, symbol_ids: Sequence[int], tokens: Sequence[str]) -> Tuple[List[Tuple[str, str, str]], bool]:
+        path: List[Tuple[str, str, str]] = []
+        current = self._start_idx
+        for idx, symbol_id in enumerate(symbol_ids):
+            if symbol_id < 0 or symbol_id >= len(self._delta[current]):
+                return path, False
+            destination = self._delta[current][symbol_id]
+            if destination < 0:
+                return path, False
+            path.append((self._states[current], tokens[idx], self._states[destination]))
+            current = destination
+        accepted = bool(self._accept_mask & (1 << current))
+        return path, accepted
 
     def as_nfa(self) -> "NFA":
         transitions: Dict[str, Dict[str, List[str]]] = {}
@@ -444,8 +489,24 @@ class NFA(Automaton):
         return self._bitset_to_names(mask)
 
     def accepts(self, input_symbols: Iterable[str]) -> bool:
+        symbol_ids = self._input_to_symbol_ids(input_symbols)
+        if _accelerator is not None:
+            try:
+                return bool(
+                    _accelerator.nfa_accepts(
+                        self._symbol_closure_matrix,
+                        self._epsilon_closure_masks[self._start_idx],
+                        self._accept_mask,
+                        symbol_ids,
+                    )
+                )
+            except (ValueError, TypeError):
+                pass
+        return self._accepts_python(symbol_ids)
+
+    def _accepts_python(self, symbol_ids: Sequence[int]) -> bool:
         current = self._epsilon_closure_masks[self._start_idx]
-        for symbol_id in self._input_to_symbol_ids(input_symbols):
+        for symbol_id in symbol_ids:
             if symbol_id < 0:
                 return False
             nxt_mask = self._subset_step(current, symbol_id)

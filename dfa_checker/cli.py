@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, List, Mapping, Optional, Sequence, Tuple
 
-from .analysis import TestCase, ensure_dfa, run_test_cases, summarize_results
+from .analysis import TestCase, analyze_graph, ensure_dfa, run_test_cases, summarize_results
 from .automata import Automaton, AutomatonError, AutomatonValidationError, DFA, NFA
 from .graphviz import write_dot
 
@@ -363,6 +363,28 @@ def _display_summary(session: Session) -> None:
         else:
             transition_text = "<none>"
         print(f"    {state}: {transition_text}")
+
+    report = analyze_graph(automaton)
+    print("  Graph check:")
+    print(f"    Reachable states: {report.get('reachable_count')} / {report.get('state_count')}")
+    unreachable = report.get('unreachable') or []
+    if unreachable:
+        print("    Unreachable: " + ", ".join(unreachable))
+    dead_states = report.get('dead_states') or []
+    if dead_states:
+        print("    Dead states: " + ", ".join(dead_states))
+    missing = report.get('missing_symbols') or []
+    if missing:
+        formatted = ", ".join(f"{state}:{symbol}" for state, symbol in missing)
+        print("    Missing transitions: " + formatted)
+    nondet = report.get('nondeterministic_states') or []
+    if nondet:
+        print("    Non-deterministic states: " + ", ".join(nondet))
+    print(f"    Total transitions: {report.get('transition_count')}")
+    if report.get('is_total'):
+        print("    Transition function is total.")
+    if report.get('has_epsilon'):
+        print("    Includes epsilon transitions.")
 
 
 def _run_tests(session: Session):
