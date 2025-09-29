@@ -116,6 +116,7 @@ class AutomatonStudio(tk.Tk):
         self._button_bindings: Dict[tk.Button, bool] = {}
         self._current_palette: Dict[str, str] = THEMES[self.current_theme].copy()
         self._graph_photo: Optional[tk.PhotoImage] = None
+        self._graph_generated = False
         self._dot_path: Optional[str] = None
 
         self._build_ui()
@@ -646,6 +647,8 @@ class AutomatonStudio(tk.Tk):
         self._last_highlight = list(highlight)
         self._last_dot_paths = list(dot_paths)
         self._graph_report = dict(graph_report)
+        self._graph_generated = False
+        self._graph_photo = None
         self._worker = None
         self._set_busy(False)
         self._release_analysis_lock()
@@ -794,9 +797,13 @@ class AutomatonStudio(tk.Tk):
                     return candidate
         return None
 
-    def _render_graph(self, highlight_edges: Optional[Sequence[Tuple[str, str]]] = None) -> None:
+    def _render_graph(self, highlight_edges: Optional[Sequence[Tuple[str, str]]] = None, *, force: bool = False) -> None:
         if highlight_edges is None:
             highlight_edges = self._current_highlight_edges()
+        if not force and not self._graph_generated:
+            self._graph_photo = None
+            self.graph_canvas.configure(image="", text="Graph not generated yet.")
+            return
         if not self.session:
             self._graph_photo = None
             self.graph_canvas.configure(image="", text="No automaton loaded.")
@@ -815,11 +822,14 @@ class AutomatonStudio(tk.Tk):
             )
             encoded = base64.b64encode(result.stdout).decode("ascii")
             self._graph_photo = tk.PhotoImage(data=encoded)
+            self._graph_generated = True
             self.graph_canvas.configure(image=self._graph_photo, text="")
         except FileNotFoundError:
+            self._graph_generated = False
             self._graph_photo = None
             self.graph_canvas.configure(image="", text="Graphviz 'dot' command not found.")
         except Exception as exc:
+            self._graph_generated = False
             self._graph_photo = None
             self.graph_canvas.configure(image="", text=f"Graph render failed: {exc}")
 
@@ -863,6 +873,9 @@ class AutomatonStudio(tk.Tk):
         self._last_highlight.clear()
         self._last_dot_paths.clear()
         self._graph_report.clear()
+        self._graph_generated = False
+        self._graph_photo = None
+        self.graph_canvas.configure(image="", text="Graph not generated yet.")
         self._update_graph_panel()
         self._reset_simulation(clear_path=True)
         self._update_interaction_states()
@@ -1075,6 +1088,8 @@ class AutomatonStudio(tk.Tk):
             self.session = session
             self._graph_report = analyze_graph(session.automaton)
             self._last_highlight = determine_highlight_path(session) or []
+            self._graph_generated = False
+            self._graph_photo = None
         highlight = self._last_highlight or determine_highlight_path(self.session)
         output_dir = self.output_dir_var.get().strip() or "artifacts"
         base_name = self.base_name_var.get().strip() or "automaton"
@@ -1090,7 +1105,7 @@ class AutomatonStudio(tk.Tk):
         else:
             self.status_var.set("DOT generation skipped.")
         self._update_graph_panel()
-        self._render_graph(self._current_highlight_edges())
+        self._render_graph(self._current_highlight_edges(), force=True)
         self._update_interaction_states()
         self._refresh_button_colors()
     # ---------------------------------------------------------------
