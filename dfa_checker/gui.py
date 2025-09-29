@@ -10,6 +10,7 @@ import base64
 import os
 import shutil
 import subprocess
+from pathlib import Path
 
 from .analysis import analyze_graph, run_test_cases, summarize_results
 from .graphviz import automaton_to_dot
@@ -234,6 +235,7 @@ class AutomatonStudio(tk.Tk):
         self.button_row.columnconfigure(0, weight=1)
         self.button_row.columnconfigure(1, weight=1)
         self.button_row.columnconfigure(2, weight=1)
+        self.button_row.columnconfigure(3, weight=1)
 
         self.analyze_button = tk.Button(
             self.button_row,
@@ -261,6 +263,15 @@ class AutomatonStudio(tk.Tk):
             pady=8,
         )
         self.graph_button.grid(row=0, column=2, sticky="ew", padx=(6, 0))
+
+        self.save_button = tk.Button(
+            self.button_row,
+            text="Save Graph",
+            command=self._save_graph,
+            padx=16,
+            pady=8,
+        )
+        self.save_button.grid(row=0, column=3, sticky="ew", padx=(6, 0))
         # right pane -------------------------------------------------
         self.output_frame = tk.Frame(self.body, bd=0)
         self.output_frame.grid(row=0, column=1, sticky="nsew")
@@ -454,6 +465,7 @@ class AutomatonStudio(tk.Tk):
             self.analyze_button,
             self.clear_button,
             self.graph_button,
+            self.save_button,
             self.output_browse,
             self.validate_button,
             self.start_button,
@@ -551,7 +563,9 @@ class AutomatonStudio(tk.Tk):
         if not payload:
             messagebox.showinfo("Automaton Studio", "Drop a config in the editor first.", parent=self)
             return
-        output_dir = self.output_dir_var.get().strip() or "artifacts"
+        output_dir = self.output_dir_var.get().strip()
+        if not output_dir:
+            output_dir = None
         base_name = self.base_name_var.get().strip() or "automaton"
         if not self._analysis_lock.acquire(blocking=False):
             messagebox.showinfo("Automaton Studio", "Already chewing on a config.", parent=self)
@@ -900,6 +914,7 @@ class AutomatonStudio(tk.Tk):
                 self.analyze_button,
                 self.clear_button,
                 self.graph_button,
+                self.save_button,
                 self.output_browse,
                 self.validate_button,
                 self.start_button,
@@ -914,6 +929,7 @@ class AutomatonStudio(tk.Tk):
         self.clear_button.configure(state="normal")
         self.output_browse.configure(state="normal")
         self.graph_button.configure(state="normal" if self.session else "disabled")
+        self.save_button.configure(state="normal" if self._graph_generated else "disabled")
         has_session = self.session is not None
         self.validate_button.configure(state="normal" if has_session else "disabled")
 
@@ -1094,26 +1110,75 @@ class AutomatonStudio(tk.Tk):
             self.session = session
             self._graph_report = analyze_graph(session.automaton)
             self._last_highlight = determine_highlight_path(session) or []
-            self._graph_generated = False
-            self._graph_photo = None
-        highlight = self._last_highlight or determine_highlight_path(self.session)
-        output_dir = self.output_dir_var.get().strip() or "artifacts"
-        base_name = self.base_name_var.get().strip() or "automaton"
+        highlight = self._last_highlight or determine_highlight_path(self.session) or []
+        self._last_highlight = list(highlight)
+        self._last_dot_paths = []
+        self._graph_generated = False
+        self._graph_photo = None
+        if self.session:
+            self._graph_report = analyze_graph(self.session.automaton)
+        self._update_graph_panel()
+        self._render_graph(highlight, force=True)
+        if self._graph_generated:
+            self.status_var.set("Graph preview updated.")
+        else:
+            message = self.graph_canvas.cget("text") or "Graph preview unavailable."
+            self.status_var.set(message)
+        self._update_interaction_states()
+        self._refresh_button_colors()
+
+    def _save_graph(self) -> None:
+        if not self.session:
+            messagebox.showinfo("Automaton Studio", "Analyze or generate a graph first.", parent=self)
+            return
+        if not self._graph_generated:
+            messagebox.showinfo("Automaton Studio", "Generate the graph preview before saving.", parent=self)
+            return
+        default_name = self.base_name_var.get().strip() or "automaton"
+        file_path = filedialog.asksaveasfilename(
+            parent=self,
+            defaultextension=".png",
+            initialfile=f"{default_name}.png",
+            filetypes=[
+                ("PNG image", "*.png"),
+                ("SVG image", "*.svg"),
+                ("PDF document", "*.pdf"),
+                ("DOT file", "*.dot"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not file_path:
+            return
+        highlight = self._current_highlight_edges()
+        dot_source = automaton_to_dot(self.session.automaton, highlight_path=highlight)
+        path_obj = Path(file_path)
+        suffix = path_obj.suffix.lower()
         try:
-            paths = write_graphs_for_session(self.session, output_dir, base_name, highlight)
+            if suffix == ".dot":
+                path_obj.write_text(dot_source + "
+", encoding="utf-8")
+            else:
+                fmt_map = {".png": "png", ".svg": "svg", ".pdf": "pdf"}
+                fmt = fmt_map.get(suffix, "png")
+                if suffix not in fmt_map:
+                    path_obj = path_obj.with_suffix(".png")
+                    fmt = "png"
+                dot_cmd = self._resolve_dot_command()
+                if not dot_cmd:
+                    messagebox.showerror("Automaton Studio", "Graphviz 'dot' command not found.", parent=self)
+                    return
+                subprocess.run(
+                    [dot_cmd, f"-T{fmt}", "-o", str(path_obj)],
+                    input=dot_source.encode("utf-8"),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    check=True,
+                )
         except Exception as exc:  # pylint: disable=broad-except
             messagebox.showerror("Automaton Studio", str(exc), parent=self)
             return
-        self._last_dot_paths = [str(path) for path in paths]
-        self.status_var.set(f"DOT updated ({len(paths)} file(s)).")
-        if paths:
-            self.status_var.set(f"DOT updated ({len(paths)} file(s)). Preview refreshed.")
-        else:
-            self.status_var.set("DOT generation skipped.")
-        self._update_graph_panel()
-        self._render_graph(self._current_highlight_edges(), force=True)
-        self._update_interaction_states()
-        self._refresh_button_colors()
+        self.status_var.set(f"Graph saved to {path_obj}")
+
     # ---------------------------------------------------------------
     def _on_close(self) -> None:
         self._worker_stop.set()
