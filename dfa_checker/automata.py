@@ -243,7 +243,7 @@ class Automaton:
                     "Give me an iterable of tokens when alphabet symbols are not single characters."
                 )
             return list(input_symbols)
-        return [self._normalize_symbol(sym) for sym in input_symbols]
+        return tuple(self._normalize_symbol(sym) for sym in input_symbols)
 
     def _input_to_symbol_ids(self, input_symbols: Iterable[str]) -> List[int]:
         tokens = self._normalize_input(input_symbols)
@@ -326,18 +326,23 @@ class DFA(Automaton):
         return self._accepts_python(symbol_ids)
 
     def _accepts_python(self, symbol_ids: Sequence[int]) -> bool:
+        # this loop is just a tipsy tour through delta-land; caching locals keeps Python from calling an Uber.
+        delta = self._delta
         current = self._start_idx
-        for symbol_id in symbol_ids:
-            if symbol_id < 0 or symbol_id >= len(self._delta[current]):
+        accept_mask = self._accept_mask
+        for sid in symbol_ids:
+            if sid < 0:
                 return False
-            destination = self._delta[current][symbol_id]
+            row = delta[current]
+            destination = row[sid] if 0 <= sid < len(row) else -1
             if destination < 0:
                 return False
             current = destination
-        return bool(self._accept_mask & (1 << current))
+        return bool(accept_mask & (1 << current))
 
     def transition_path(self, tokens: Sequence[str]) -> Tuple[List[Tuple[str, str, str]], bool]:
         symbol_ids = self._input_to_symbol_ids(tokens)
+        # return every stumble between states so the GUI can replay the chaos later
         if any(symbol_id < 0 for symbol_id in symbol_ids):
             return [], False
         if self._accelerator_ready and _ACCEL_HAS_DFA_TRACE:
@@ -347,10 +352,11 @@ class DFA(Automaton):
                 trace = None
             if trace is not None:
                 states_idx = list(trace)
+                states = self._states
                 path: List[Tuple[str, str, str]] = []
                 for idx, dest_idx in enumerate(states_idx[1:]):
                     src_idx = states_idx[idx]
-                    path.append((self._states[src_idx], tokens[idx], self._states[dest_idx]))
+                    path.append((states[src_idx], tokens[idx], states[dest_idx]))
                 accepted = bool(self._accept_mask & (1 << states_idx[-1]))
                 return path, accepted
         return self._trace_python(symbol_ids, tokens)
@@ -511,24 +517,29 @@ class NFA(Automaton):
         return self._accepts_python(symbol_ids)
 
     def _accepts_python(self, symbol_ids: Sequence[int]) -> bool:
+        # NFA party trick: closure masks let us shotgun all epsilon moves at once.
         current = self._epsilon_closure_masks[self._start_idx]
-        for symbol_id in symbol_ids:
-            if symbol_id < 0:
+        subset_step = self._subset_step
+        accept_mask = self._accept_mask
+        for sid in symbol_ids:
+            if sid < 0:
                 return False
-            nxt_mask = self._subset_step(current, symbol_id)
+            nxt_mask = subset_step(current, sid)
             if not nxt_mask:
                 return False
             current = nxt_mask
-        return bool(current & self._accept_mask)
+        return bool(current & accept_mask)
 
     def _subset_step_python(self, subset_mask: int, symbol_idx: int) -> int:
+        # do-or-die bit twiddling: every popcount drip feeds us another destination set.
+        closure_matrix = self._symbol_closure_matrix
         mask = 0
         temp = subset_mask
         while temp:
             bit = temp & -temp
             temp ^= bit
             state_idx = bit.bit_length() - 1
-            mask |= self._symbol_closure_matrix[state_idx][symbol_idx]
+            mask |= closure_matrix[state_idx][symbol_idx]
         return mask
 
     def _subset_step(self, subset_mask: int, symbol_idx: int) -> int:

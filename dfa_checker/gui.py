@@ -784,16 +784,19 @@ class AutomatonStudio(tk.Tk):
         return lines
 
     def _highlight_edges_for_step(self, step: int) -> List[Tuple[str, str]]:
+        """return the edges we've staggered across so far"""
         if not self._simulation_path:
             return []
         return [(src, dst) for src, _, dst in self._simulation_path[:step]]
 
     def _current_highlight_edges(self) -> List[Tuple[str, str]]:
+        """hand the renderer whatever subset of edges matches our current brain cell count"""
         if self._simulation_path:
             return self._highlight_edges_for_step(self._simulation_index)
         return list(self._last_highlight)
 
     def _resolve_dot_command(self) -> Optional[str]:
+        """try to find graphviz/dot because future me will forget where it's installed"""
         if self._dot_path and os.path.exists(self._dot_path):
             return self._dot_path
         dot_cmd = shutil.which("dot")
@@ -818,6 +821,7 @@ class AutomatonStudio(tk.Tk):
         return None
 
     def _render_graph(self, highlight_edges: Optional[Sequence[Tuple[str, str]]] = None, *, force: bool = False) -> None:
+        """render the automaton inline; think of it as a livestream from the state machine frat house"""
         if highlight_edges is None:
             highlight_edges = self._current_highlight_edges()
         if not force and not self._graph_generated:
@@ -1096,6 +1100,7 @@ class AutomatonStudio(tk.Tk):
         self._update_interaction_states()
 
     def _generate_graphs(self) -> None:
+        """build/refresh the preview without touching disk unless save button gets involved"""
         if not self.session:
             payload = self.config_text.get("1.0", "end").strip()
             if not payload:
@@ -1128,6 +1133,7 @@ class AutomatonStudio(tk.Tk):
         self._refresh_button_colors()
 
     def _save_graph(self) -> None:
+        """manual save button because sometimes you actually want receipts"""
         if not self.session:
             messagebox.showinfo("Automaton Studio", "Analyze or generate a graph first.", parent=self)
             return

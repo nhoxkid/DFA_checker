@@ -259,7 +259,7 @@ def run(argv: Sequence[str] | None = None) -> int:
     _display_summary(session)
     _run_tests(session)
     highlight_path = determine_highlight_path(session)
-    paths = write_graphs_for_session(session, args.output_dir, args.base_name, highlight_path)
+    paths = write_graphs_for_session(session, args.output_dir, args.base_name, highlight_path, save_files=True)
     if paths:
         print("\nDOT files written:")
         for path in paths:
@@ -428,15 +428,21 @@ def determine_highlight_path(session: Session) -> List[Tuple[str, str]]:
 
 def write_graphs_for_session(
     session: Session,
-    output_dir: Path | str,
+    output_dir: Optional[Path | str],
     base_name: Optional[str],
     highlight_path: Sequence[Tuple[str, str]],
+    *,
+    save_files: bool = True,
 ) -> List[Path]:
-    out_dir = Path(output_dir)
+    if not save_files:
+        # no disk I/O, we just vibe with the preview.
+        return []
+
+    out_dir = Path(output_dir) if output_dir is not None else Path('artifacts')
     out_dir.mkdir(parents=True, exist_ok=True)
 
     name = (base_name or 'automaton').strip() or 'automaton'
-    if session.interactive:
+    if session.interactive and output_dir is not None:
         name = _prompt_optional(
             f"Base filename for DOT outputs [{name}]: ", default=name
         )
