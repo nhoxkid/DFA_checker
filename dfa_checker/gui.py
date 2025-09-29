@@ -6,7 +6,13 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
+import base64
+import os
+import shutil
+import subprocess
+
 from .analysis import analyze_graph, run_test_cases, summarize_results
+from .graphviz import automaton_to_dot
 from .automata import AutomatonError
 from .cli import (
     EMPTY_INPUT_LABEL,
@@ -109,6 +115,8 @@ class AutomatonStudio(tk.Tk):
         self._graph_report: Dict[str, object] = {}
         self._button_bindings: Dict[tk.Button, bool] = {}
         self._current_palette: Dict[str, str] = THEMES[self.current_theme].copy()
+        self._graph_photo: Optional[tk.PhotoImage] = None
+        self._dot_path: Optional[str] = None
 
         self._build_ui()
         self.apply_theme()
@@ -360,18 +368,23 @@ class AutomatonStudio(tk.Tk):
         self.simulation_status_label.grid(row=1, column=0, columnspan=2, sticky="ew")
 
         self.graph_container = tk.Frame(self.output_frame, bd=1, relief="solid")
-        self.graph_container.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+        self.graph_container.grid(row=4, column=0, sticky="nsew", pady=(12, 0))
+        self.graph_container.rowconfigure(0, weight=1)
         self.graph_container.columnconfigure(0, weight=1)
+
+        self.graph_canvas = tk.Label(self.graph_container, bd=0, relief="flat", anchor="center")
+        self.graph_canvas.grid(row=0, column=0, sticky="nsew")
+        self.graph_canvas.configure(text="Graph preview unavailable.", justify="center")
 
         self.graph_text = tk.Text(
             self.graph_container,
             wrap="word",
             font=self.base_font,
-            height=6,
+            height=4,
             relief="flat",
             state="disabled",
         )
-        self.graph_text.grid(row=0, column=0, sticky="nsew")
+        self.graph_text.grid(row=1, column=0, sticky="ew", pady=(4, 0))
 
         self.output_container = tk.Frame(self.output_frame, bd=1, relief="solid")
         self.output_container.grid(row=5, column=0, sticky="nsew", pady=(12, 0))
@@ -426,6 +439,7 @@ class AutomatonStudio(tk.Tk):
             self.validation_result_label,
             self.simulation_label,
             self.simulation_status_label,
+            self.graph_canvas,
             self.status_bar,
         ]
         self._buttons = [
@@ -480,11 +494,13 @@ class AutomatonStudio(tk.Tk):
                 text_widget.configure(state="disabled")
         for button in self._buttons:
             button.configure(relief="flat", borderwidth=0, highlightthickness=0)
+        self.graph_canvas.configure(bg=palette["surface"], fg=palette["muted"], text=self.graph_canvas.cget("text"))
         self._style_buttons(palette)
         self.status_bar.configure(bg=palette["surface"], fg=palette["muted"])
         self.theme_button.configure(
             text="Dark mode" if self.current_theme == "light" else "Light mode"
         )
+        self._render_graph(self._current_highlight_edges())
 
     def toggle_theme(self) -> None:
         self.current_theme = "dark" if self.current_theme == "light" else "light"
@@ -649,6 +665,7 @@ class AutomatonStudio(tk.Tk):
             lines.extend(dot_paths)
         self._update_output(lines)
         self._update_graph_panel()
+        self._render_graph(self._current_highlight_edges())
 
         if graph_error is not None:
             messagebox.showwarning(
@@ -742,6 +759,71 @@ class AutomatonStudio(tk.Tk):
         if report.get("has_epsilon"):
             lines.append("Includes epsilon transitions.")
         return lines
+
+    def _highlight_edges_for_step(self, step: int) -> List[Tuple[str, str]]:
+        if not self._simulation_path:
+            return []
+        return [(src, dst) for src, _, dst in self._simulation_path[:step]]
+
+    def _current_highlight_edges(self) -> List[Tuple[str, str]]:
+        if self._simulation_path:
+            return self._highlight_edges_for_step(self._simulation_index)
+        return list(self._last_highlight)
+
+    def _resolve_dot_command(self) -> Optional[str]:
+        if self._dot_path and os.path.exists(self._dot_path):
+            return self._dot_path
+        dot_cmd = shutil.which("dot")
+        if dot_cmd:
+            self._dot_path = dot_cmd
+            return dot_cmd
+        candidates = []
+        program_files = [
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+            os.environ.get("ProgramW6432"),
+        ]
+        subpaths = ["Graphviz\\bin\\dot.exe", "Graphviz2.38\\bin\\dot.exe"]
+        for root in program_files:
+            if not root:
+                continue
+            for sub in subpaths:
+                candidate = os.path.join(root, sub)
+                if os.path.exists(candidate):
+                    self._dot_path = candidate
+                    return candidate
+        return None
+
+    def _render_graph(self, highlight_edges: Optional[Sequence[Tuple[str, str]]] = None) -> None:
+        if highlight_edges is None:
+            highlight_edges = self._current_highlight_edges()
+        if not self.session:
+            self._graph_photo = None
+            self.graph_canvas.configure(image="", text="No automaton loaded.")
+            return
+        try:
+            dot_source = automaton_to_dot(self.session.automaton, highlight_path=highlight_edges)
+            dot_cmd = self._resolve_dot_command()
+            if not dot_cmd:
+                raise FileNotFoundError("Graphviz 'dot' command not found.")
+            result = subprocess.run(
+                [dot_cmd, "-Tpng"],
+                input=dot_source.encode("utf-8"),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            encoded = base64.b64encode(result.stdout).decode("ascii")
+            self._graph_photo = tk.PhotoImage(data=encoded)
+            self.graph_canvas.configure(image=self._graph_photo, text="")
+        except FileNotFoundError:
+            self._graph_photo = None
+            self.graph_canvas.configure(image="", text="Graphviz 'dot' command not found.")
+        except Exception as exc:
+            self._graph_photo = None
+            self.graph_canvas.configure(image="", text=f"Graph render failed: {exc}")
+
+
 
     def _format_test_lines(self, results, summary: Dict[str, int]) -> List[str]:
         lines = [f"Passed {summary['passed']} of {summary['total']} cases."]
@@ -903,6 +985,7 @@ class AutomatonStudio(tk.Tk):
             self.simulation_text.insert("end", "No deterministic path for this string.\n")
             self.simulation_status_var.set("Simulation unavailable for this string.")
         self.simulation_text.configure(state="disabled")
+        self._render_graph(self._highlight_edges_for_step(0))
         self._update_interaction_states()
     def _start_simulation(self) -> None:
         if self._simulation_running or not self._simulation_path:
@@ -912,6 +995,7 @@ class AutomatonStudio(tk.Tk):
         self.simulation_text.configure(state="normal")
         self.simulation_text.delete("1.0", "end")
         self.simulation_text.configure(state="disabled")
+        self._render_graph(self._highlight_edges_for_step(0))
         self._advance_simulation_step()
         self._update_interaction_states()
 
@@ -923,6 +1007,7 @@ class AutomatonStudio(tk.Tk):
             self.simulation_status_var.set(f"Finished: {verdict}.")
             self._simulation_running = False
             self._simulation_after = None
+            self._render_graph(self._highlight_edges_for_step(len(self._simulation_path)))
             self._update_interaction_states()
             return
         src, symbol, dest = self._simulation_path[self._simulation_index]
@@ -937,6 +1022,7 @@ class AutomatonStudio(tk.Tk):
             f"Step {self._simulation_index + 1}/{len(self._simulation_path)}: {src} --{symbol}--> {dest}"
         )
         self._simulation_index += 1
+        self._render_graph(self._highlight_edges_for_step(self._simulation_index))
         self._simulation_after = self.after(ANIMATION_INTERVAL_MS, self._advance_simulation_step)
         self._update_interaction_states()
 
@@ -971,6 +1057,7 @@ class AutomatonStudio(tk.Tk):
             self.simulation_text.insert("end", "No simulation loaded.\n")
             self.simulation_status_var.set("Simulation idle.")
         self.simulation_text.configure(state="disabled")
+        self._render_graph(self._current_highlight_edges())
         self._update_interaction_states()
 
     def _generate_graphs(self) -> None:
@@ -988,9 +1075,11 @@ class AutomatonStudio(tk.Tk):
         self._last_dot_paths = [str(path) for path in paths]
         self.status_var.set(f"DOT updated ({len(paths)} file(s)).")
         if paths:
-            files_text = "\n".join(["Saved DOT files:"] + [str(path) for path in paths])
-            messagebox.showinfo("Automaton Studio", files_text, parent=self)
+            self.status_var.set(f"DOT updated ({len(paths)} file(s)). Preview refreshed.")
+        else:
+            self.status_var.set("DOT generation skipped.")
         self._update_graph_panel()
+        self._render_graph(self._current_highlight_edges())
         self._update_interaction_states()
         self._refresh_button_colors()
     # ---------------------------------------------------------------

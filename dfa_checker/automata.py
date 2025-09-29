@@ -6,8 +6,14 @@ from typing import Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence,
 
 try:
     from . import _accelerator
+    _ACCEL_HAS_DFA_ACCEPTS = hasattr(_accelerator, "dfa_accepts")
+    _ACCEL_HAS_DFA_TRACE = hasattr(_accelerator, "dfa_trace")
+    _ACCEL_HAS_NFA_ACCEPTS = hasattr(_accelerator, "nfa_accepts")
 except ImportError:
     _accelerator = None
+    _ACCEL_HAS_DFA_ACCEPTS = False
+    _ACCEL_HAS_DFA_TRACE = False
+    _ACCEL_HAS_NFA_ACCEPTS = False
 
 
 class AutomatonError(Exception):
@@ -289,7 +295,7 @@ class DFA(Automaton):
                     )
         super().__init__(states, alphabet, normalized, start_state, accept_states)
         self._delta = self._build_delta()
-        self._accelerator_ready = _accelerator is not None
+        self._accelerator_ready = bool(_accelerator) and _ACCEL_HAS_DFA_ACCEPTS and _ACCEL_HAS_DFA_TRACE
         self.validate()
 
     def _build_delta(self) -> Tuple[Tuple[int, ...], ...]:
@@ -310,12 +316,12 @@ class DFA(Automaton):
 
     def accepts(self, input_symbols: Iterable[str]) -> bool:
         symbol_ids = self._input_to_symbol_ids(input_symbols)
-        if _accelerator is not None and self._accelerator_ready:
+        if self._accelerator_ready and _ACCEL_HAS_DFA_ACCEPTS:
             try:
                 return bool(
                     _accelerator.dfa_accepts(self._delta, self._start_idx, self._accept_mask, symbol_ids)
                 )
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 pass
         return self._accepts_python(symbol_ids)
 
@@ -334,10 +340,10 @@ class DFA(Automaton):
         symbol_ids = self._input_to_symbol_ids(tokens)
         if any(symbol_id < 0 for symbol_id in symbol_ids):
             return [], False
-        if _accelerator is not None and self._accelerator_ready:
+        if self._accelerator_ready and _ACCEL_HAS_DFA_TRACE:
             try:
                 trace = _accelerator.dfa_trace(self._delta, self._start_idx, symbol_ids)
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 trace = None
             if trace is not None:
                 states_idx = list(trace)
@@ -490,7 +496,7 @@ class NFA(Automaton):
 
     def accepts(self, input_symbols: Iterable[str]) -> bool:
         symbol_ids = self._input_to_symbol_ids(input_symbols)
-        if _accelerator is not None:
+        if _accelerator is not None and _ACCEL_HAS_NFA_ACCEPTS:
             try:
                 return bool(
                     _accelerator.nfa_accepts(
@@ -500,7 +506,7 @@ class NFA(Automaton):
                         symbol_ids,
                     )
                 )
-            except (ValueError, TypeError):
+            except (ValueError, TypeError, AttributeError):
                 pass
         return self._accepts_python(symbol_ids)
 
