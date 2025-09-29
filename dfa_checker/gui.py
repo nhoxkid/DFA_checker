@@ -557,7 +557,7 @@ class AutomatonStudio(tk.Tk):
         except ValueError as exc:
             if cancelled():
                 return
-            self.after(0, lambda: self._on_analysis_error(exc))
+            self.after(0, lambda exc=exc: self._on_analysis_error(exc))
             return
         if cancelled():
             return
@@ -566,7 +566,7 @@ class AutomatonStudio(tk.Tk):
         except (AutomatonError, ValueError) as exc:
             if cancelled():
                 return
-            self.after(0, lambda: self._on_analysis_error(exc))
+            self.after(0, lambda exc=exc: self._on_analysis_error(exc))
             return
         if cancelled():
             return
