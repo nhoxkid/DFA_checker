@@ -12,11 +12,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     if argv is None:
         argv = sys.argv[1:]
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--gui", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--cli", action="store_true", help=argparse.SUPPRESS)
     args, remaining = parser.parse_known_args(argv)
-    if args.gui:
-        return run_gui()
-    return run_cli(remaining)
+    if args.cli or remaining:
+        return run_cli(remaining)
+    return run_gui()
 
 
 if __name__ == "__main__":

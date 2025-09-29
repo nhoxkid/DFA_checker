@@ -4,6 +4,11 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, FrozenSet, Iterable, List, Mapping, Optional, Sequence, Set, Tuple
 
+try:
+    from . import _accelerator
+except ImportError:
+    _accelerator = None
+
 
 class AutomatonError(Exception):
     """Base meltdown for automata drama."""
@@ -333,6 +338,7 @@ class NFA(Automaton):
         "_epsilon_matrix",
         "_epsilon_closure_masks",
         "_symbol_closure_matrix",
+        "_accelerator_ready",
     )
 
     def __init__(
@@ -352,8 +358,22 @@ class NFA(Automaton):
             self._epsilon_symbol,
             self._blank_row,
         )
-        self._epsilon_closure_masks = self._build_epsilon_closures()
-        self._symbol_closure_matrix = self._build_symbol_matrix()
+        self._accelerator_ready = False
+        if _accelerator is not None:
+            try:
+                closures_tuple = tuple(int(v) for v in _accelerator.compute_epsilon_closures(self._epsilon_matrix))
+                symbol_matrix = _accelerator.build_symbol_matrix(self._transition_matrix, closures_tuple)
+                self._epsilon_closure_masks = closures_tuple
+                self._symbol_closure_matrix = tuple(
+                    tuple(int(v) for v in row) for row in symbol_matrix
+                )
+                self._accelerator_ready = True
+            except (ValueError, TypeError):
+                self._epsilon_closure_masks = self._build_epsilon_closures()
+                self._symbol_closure_matrix = self._build_symbol_matrix()
+        else:
+            self._epsilon_closure_masks = self._build_epsilon_closures()
+            self._symbol_closure_matrix = self._build_symbol_matrix()
         self.validate()
 
     @property
@@ -428,19 +448,13 @@ class NFA(Automaton):
         for symbol_id in self._input_to_symbol_ids(input_symbols):
             if symbol_id < 0:
                 return False
-            nxt_mask = 0
-            temp = current
-            while temp:
-                bit = temp & -temp
-                temp ^= bit
-                state_idx = bit.bit_length() - 1
-                nxt_mask |= self._symbol_closure_matrix[state_idx][symbol_id]
+            nxt_mask = self._subset_step(current, symbol_id)
             if not nxt_mask:
                 return False
             current = nxt_mask
         return bool(current & self._accept_mask)
 
-    def _subset_step(self, subset_mask: int, symbol_idx: int) -> int:
+    def _subset_step_python(self, subset_mask: int, symbol_idx: int) -> int:
         mask = 0
         temp = subset_mask
         while temp:
@@ -449,6 +463,16 @@ class NFA(Automaton):
             state_idx = bit.bit_length() - 1
             mask |= self._symbol_closure_matrix[state_idx][symbol_idx]
         return mask
+
+    def _subset_step(self, subset_mask: int, symbol_idx: int) -> int:
+        if self._accelerator_ready:
+            try:
+                return int(
+                    _accelerator.subset_step(self._symbol_closure_matrix, subset_mask, symbol_idx)
+                )
+            except (ValueError, TypeError):
+                pass
+        return self._subset_step_python(subset_mask, symbol_idx)
 
     def to_dfa(self) -> DFA:
         alphabet = list(self._alphabet)
